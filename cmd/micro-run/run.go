@@ -2,13 +2,17 @@ package run
 
 import (
 	"bufio"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/urfave/cli/v2"
 	"go-micro.dev/v5/cmd"
@@ -101,18 +105,32 @@ func Run(c *cli.Context) error {
 	for i, mainFile := range mainFiles {
 		serviceDir := filepath.Dir(mainFile)
 		var serviceName string
-		absDir, _ := filepath.Abs(dir)
 		absServiceDir, _ := filepath.Abs(serviceDir)
-		if absDir == absServiceDir {
-			// If main.go is in the root dir being run, use the current working dir name
+		// Determine service name: if absServiceDir matches the provided dir (which may be "."), use cwd
+		if absServiceDir == dir || dir == "." {
 			cwd, _ := os.Getwd()
 			serviceName = filepath.Base(cwd)
 		} else {
 			serviceName = filepath.Base(serviceDir)
 		}
-		logFilePath := filepath.Join(logsDir, serviceName+".log")
-		binPath := filepath.Join(binDir, serviceName)
-		pidFilePath := filepath.Join(runDir, serviceName+".pid")
+		serviceNameForPid := serviceName + "-" + fmt.Sprintf("%x", md5.Sum([]byte(absServiceDir)))[:8]
+		logFilePath := filepath.Join(logsDir, serviceNameForPid+".log")
+		binPath := filepath.Join(binDir, serviceNameForPid)
+		pidFilePath := filepath.Join(runDir, serviceNameForPid+".pid")
+
+		// Check if pid file exists and process is running
+		if pidBytes, err := os.ReadFile(pidFilePath); err == nil {
+			lines := strings.Split(string(pidBytes), "\n")
+			if len(lines) > 0 && len(lines[0]) > 0 {
+				pid := lines[0]
+				if _, err := os.FindProcess(parsePid(pid)); err == nil {
+					if processRunning(pid) {
+						fmt.Fprintf(os.Stderr, "Service %s already running (pid %s)\n", serviceNameForPid, pid)
+						continue
+					}
+				}
+			}
+		}
 
 		logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -139,12 +157,12 @@ func Run(c *cli.Context) error {
 			scanner := bufio.NewScanner(pr)
 			for scanner.Scan() {
 				line := scanner.Text()
-				// Write to terminal with color
+				// Write to terminal with color and service name
 				fmt.Printf("%s[%s]\033[0m %s\n", color, name, line)
-				// Write to log file (without color)
-				logFile.WriteString(line + "\n")
+				// Write to log file with service name prefix
+				logFile.WriteString("[" + name + "] " + line + "\n")
 			}
-		}(serviceName, color, pr, logFile)
+		}(serviceNameForPid, color, pr, logFile)
 		if err := cmd.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to start service %s: %v\n", serviceName, err)
 			pw.Close()
@@ -152,8 +170,7 @@ func Run(c *cli.Context) error {
 		}
 		procs = append(procs, cmd)
 		pidFiles = append(pidFiles, pidFilePath)
-		absServiceDir, _ = filepath.Abs(serviceDir)
-		os.WriteFile(pidFilePath, []byte(fmt.Sprintf("%d\n%s\n", cmd.Process.Pid, absServiceDir)), 0644)
+		os.WriteFile(pidFilePath, []byte(fmt.Sprintf("%d\n%s\n%s\n%s\n", cmd.Process.Pid, absServiceDir, serviceName, time.Now().Format(time.RFC3339))), 0644)
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt)
@@ -173,6 +190,24 @@ func Run(c *cli.Context) error {
 		_ = proc.Wait()
 	}
 	return nil
+}
+
+// Add helpers for process check
+func parsePid(pidStr string) int {
+	pid, _ := strconv.Atoi(pidStr)
+	return pid
+}
+func processRunning(pidStr string) bool {
+	pid := parsePid(pidStr)
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// On Unix, sending signal 0 checks if process exists
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 func init() {
